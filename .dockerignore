@@ -1,0 +1,6 @@
+*
+!bot.py
+!gift_offer/
+!gift_offer/*.py
+!gift_offer/services/
+!gift_offer/services/*.py

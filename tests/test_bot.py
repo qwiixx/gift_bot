@@ -1,0 +1,2231 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import http.client
+import io
+import json
+import os
+import socket
+import tempfile
+import time
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
+
+from bot import connect_to_telegram, ensure_polling, health_server, poll, run
+from gift_offer import admin
+from gift_offer.config import Config, load_dotenv
+from gift_offer.domain import OfferError, parse_buy
+from gift_offer.service import Service
+from gift_offer.store import Store
+from gift_offer.telegram import Telegram, TelegramError, TransportError
+from gift_offer.ui import (
+    GRAM_EMOJI_ID,
+    NEGATIVE_EMOJI_ID,
+    POSITIVE_EMOJI_ID,
+    STARS_EMOJI_ID,
+    has_custom_emoji,
+)
+from gift_offer.views import TEXT, card_payload, help_text, keyboard, render_text, transfer_url
+
+BUYER, SELLER, BOT = 111, 222, 999
+CONNECTION = {
+    "id": "business-1",
+    "user": {"id": BUYER, "first_name": "Buyer", "username": "real_buyer"},
+    "user_chat_id": BUYER,
+    "date": 1800000000,
+    "rights": {"can_reply": True, "can_delete_all_messages": True},
+    "is_enabled": True,
+}
+
+
+class FakeAPI:
+    def __init__(self):
+        self.calls = []
+        self.failures: dict[str, list[Exception]] = {}
+        self.connection = copy.deepcopy(CONNECTION)
+        self.counter = 100
+
+    async def call(self, method: str, **params):
+        self.calls.append((method, copy.deepcopy(params)))
+        if self.failures.get(method):
+            raise self.failures[method].pop(0)
+        if method == "getBusinessConnection":
+            return copy.deepcopy(self.connection)
+        if method == "sendMessage":
+            self.counter += 1
+            return {"message_id": self.counter}
+        if method == "editMessageText":
+            return {"message_id": params["message_id"]}
+        return True
+
+
+class ParsingTests(unittest.TestCase):
+    def test_reference_commands(self):
+        cases = [
+            (".buy https://t.me/nft/DurovsCap-1234 500 stars", "500", "stars", "ru"),
+            (".buy https://t.me/nft/DurovsCap-1234 10 gram en", "10", "gram", "en"),
+            (".buy https://t.me/nft/DurovsCap-1234 250 stars zh", "250", "stars", "zh"),
+            (
+                ".buy https://t.me/nft/CupidCharm-15484 0.000000001 gram ar",
+                "0.000000001",
+                "gram",
+                "ar",
+            ),
+        ]
+        for command, amount, currency, language in cases:
+            with self.subTest(command=command):
+                spec = parse_buy(command)
+                self.assertEqual(
+                    (spec.amount, spec.currency, spec.language), (amount, currency, language)
+                )
+
+    def test_decimal_values_normalize_without_float_rounding(self):
+        self.assertEqual(parse_buy(".buy https://t.me/nft/Gift-1 10.5000 gram").amount, "10.5")
+        self.assertEqual(parse_buy(".buy https://t.me/nft/Gift-1 8900.0 stars").amount, "8900")
+
+    def test_rejects_unsafe_urls(self):
+        for url in [
+            "http://t.me/nft/Gift-1",
+            "https://t.me.evil.test/nft/Gift-1",
+            "https://t.me@evil.test/nft/Gift-1",
+            "https://evil.test/nft/Gift-1",
+            "https://t.me:443/nft/Gift-1",
+            "file:///nft/Gift-1",
+            "https://t.me/nft/Gift-1?to=somebody",
+            "https://t.me/nft/Gift-1#payload",
+            "https://t.me/nft/Gift-0",
+        ]:
+            with self.subTest(url=url), self.assertRaises(OfferError):
+                parse_buy(f".buy {url} 500 stars")
+
+    def test_rejects_invalid_prices_and_options(self):
+        for tail in [
+            "0 stars",
+            "-1 stars",
+            "NaN gram",
+            "Infinity gram",
+            "1e3 gram",
+            "1.1 stars",
+            "1.0000000001 gram",
+            "100000001 stars",
+            "1000001 gram",
+            "5 rub",
+            "5 stars xx",
+        ]:
+            with self.subTest(tail=tail), self.assertRaises(OfferError):
+                parse_buy(f".buy https://t.me/nft/Gift-1 {tail}")
+
+
+class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.now = 1800000000
+        self.store = Store(":memory:")
+        self.api = FakeAPI()
+        self.config = Config(token="123456:" + "X" * 30, cooldown=0)
+        self.service = Service(self.config, self.store, self.api, BOT, clock=lambda: self.now)
+
+    async def asyncTearDown(self):
+        self.store.close()
+
+    def message(
+        self,
+        text: str = ".buy https://t.me/nft/CupidCharm-15484 8900 stars ru",
+        message_id: int = 10,
+    ) -> dict:
+        return {
+            "business_message": {
+                "business_connection_id": CONNECTION["id"],
+                "message_id": message_id,
+                "date": self.now,
+                "from": {"id": BUYER, "first_name": "Buyer"},
+                "chat": {
+                    "id": SELLER,
+                    "type": "private",
+                    "first_name": "Seller",
+                    "username": "seller_user",
+                },
+                "text": text,
+            }
+        }
+
+    async def create_offer(self, command: str | None = None, message_id: int = 10) -> dict:
+        update = self.message(message_id=message_id)
+        if command:
+            update["business_message"]["text"] = command
+        await self.service.handle(update)
+        return self.store.from_source(CONNECTION["id"], SELLER, message_id)
+
+    def callback(self, offer: dict, action: str, actor_id: int) -> dict:
+        return {
+            "callback_query": {
+                "id": "query-" + action,
+                "from": {"id": actor_id, "language_code": "ru"},
+                "data": f"g:{offer['id']}:{action}",
+                "message": {
+                    "message_id": offer["card_message_id"] or 501,
+                    "date": self.now,
+                    "business_connection_id": offer["connection_id"],
+                    "chat": {"id": offer["chat_id"], "type": "private"},
+                    "sender_business_bot": {"id": BOT},
+                },
+            }
+        }
+
+    async def act(self, offer: dict, action: str, actor: int) -> dict:
+        await self.service.handle(self.callback(offer, action, actor))
+        return self.store.offer(offer["id"])
+
+    def private(self, text: str, actor: int = BUYER, message_id: int = 50) -> dict:
+        return {
+            "message": {
+                "text": text,
+                "message_id": message_id,
+                "date": self.now,
+                "from": {
+                    "id": actor,
+                    "first_name": "Buyer" if actor == BUYER else "Visitor",
+                    "username": "real_buyer" if actor == BUYER else "visitor_user",
+                },
+                "chat": {"id": actor, "type": "private"},
+            }
+        }
+
+    async def activate(self):
+        await self.service.handle({"business_connection": copy.deepcopy(CONNECTION)})
+        await self.service.handle(self.private("/ClezzyKryt"))
+
+    async def test_full_flow_payment_before_gift(self):
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "pending")
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        offer = await self.act(offer, "settled", SELLER)
+        self.assertEqual(offer["status"], "payment_reported")
+        offer = await self.act(offer, "sent", SELLER)
+        self.assertEqual(offer["status"], "gift_reported")
+        offer = await self.act(offer, "received", BUYER)
+        self.assertEqual(offer["status"], "completed")
+        self.assertIn("по их заявлениям", render_text(offer, self.config.name))
+        actions = [r[0] for r in self.store.db.execute("SELECT action FROM events ORDER BY id")]
+        self.assertEqual(actions, ["create", "accept", "settled", "sent", "received"])
+
+    async def test_minimal_transfer_flow_closes_without_claiming_payment(self):
+        offer = await self.create_offer()
+        pending = keyboard(offer)["inline_keyboard"]
+        self.assertEqual([[b["text"] for b in row] for row in pending], [["Отклонить", "Принять"]])
+        offer = await self.act(offer, "accept", SELLER)
+        accepted = keyboard(offer, "real_buyer")["inline_keyboard"]
+        self.assertEqual(
+            [[b["text"] for b in row] for row in accepted],
+            [["Передать подарок"], ["Подтвердить передачу"]],
+        )
+        self.assertEqual(accepted[0][0]["url"], "tg://send_gift?to=real_buyer")
+        self.assertEqual(accepted[1][0]["callback_data"], f"g:{offer['id']}:confirm_transfer")
+        self.assertEqual(offer["status"], "accepted")  # Opening a URL records no transfer.
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "transfer_confirmed")
+        self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(keyboard(offer)["inline_keyboard"], [])
+        transfers = self.store.audit_page("transfers")
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(
+            (transfers[0]["actor_id"], transfers[0]["recipient_id"], transfers[0]["evidence"]),
+            (SELLER, BUYER, "user_statement"),
+        )
+        text = render_text(offer, self.config.name)
+        self.assertIn("Продавец подтвердил передачу", text)
+        self.assertNotIn("получении подарка и оплаты", text)
+
+    async def test_transfer_confirmation_requires_acceptance_and_the_seller_and_is_idempotent(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "pending")
+        offer = await self.act(offer, "accept", SELLER)
+        for actor in (BUYER, 333):
+            offer = await self.act(offer, "confirm_transfer", actor)
+            self.assertEqual(offer["status"], "accepted")
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        for action, actor in [
+            ("confirm_transfer", SELLER),
+            ("sent", SELLER),
+            ("settled", SELLER),
+            ("received", BUYER),
+            ("cancel", BUYER),
+            ("reject", SELLER),
+        ]:
+            offer = await self.act(offer, action, actor)
+            self.assertEqual(offer["status"], "transfer_confirmed")
+            self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
+        actions = [row[0] for row in self.store.db.execute("SELECT action FROM events ORDER BY id")]
+        self.assertEqual(actions, ["create", "accept", "confirm_transfer"])
+
+    async def test_upgrade_refreshes_existing_card_without_resending_and_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            previous = Store(path)
+            offer = previous.create(
+                parse_buy(".buy https://t.me/nft/Gift-1 500 stars"),
+                CONNECTION,
+                {"chat": {"id": SELLER}, "message_id": 10},
+                self.now,
+                21600,
+            )
+            previous.attach_card(offer["id"], 101)
+            previous.transition(offer["id"], "accept", SELLER, self.now)
+            previous.mark_clean(offer["id"], "accepted")
+            previous.set_setting("card_layout", "old")
+            previous.set_setting("gift_recipient_username", "real_buyer")
+            previous.close()
+            upgraded = Store(path)
+            try:
+                self.assertEqual(upgraded.offer(offer["id"])["dirty"], 1)
+                service = Service(self.config, upgraded, self.api, BOT, clock=lambda: self.now)
+                await service.tick()
+                edits = [params for method, params in self.api.calls if method == "editMessageText"]
+                self.assertEqual(len(edits), 1)
+                self.assertEqual(edits[0]["message_id"], 101)
+                self.assertEqual(
+                    [
+                        [b["text"] for b in row]
+                        for row in edits[0]["reply_markup"]["inline_keyboard"]
+                    ],
+                    [["Передать подарок"], ["Подтвердить передачу"]],
+                )
+                self.assertFalse(edits[0]["link_preview_options"]["is_disabled"])
+                self.assertEqual(edits[0]["link_preview_options"]["url"], offer["gift_url"])
+                self.assertFalse(edits[0]["link_preview_options"]["show_above_text"])
+                self.assertFalse(any(method == "sendMessage" for method, _ in self.api.calls))
+                self.assertEqual(upgraded.offer(offer["id"])["dirty"], 0)
+            finally:
+                upgraded.close()
+            reopened = Store(path)
+            try:
+                self.assertEqual(reopened.offer(offer["id"])["dirty"], 0)
+            finally:
+                reopened.close()
+        self.assertFalse(
+            any(
+                "transfer" in method.lower() or "invoice" in method.lower()
+                for method, _ in self.api.calls
+            )
+        )
+
+    async def test_full_flow_payment_after_gift(self):
+        offer = await self.create_offer()
+        for action, actor, status in [
+            ("accept", SELLER, "accepted"),
+            ("sent", SELLER, "gift_reported"),
+            ("received", BUYER, "gift_received"),
+            ("settled", SELLER, "completed"),
+        ]:
+            offer = await self.act(offer, action, actor)
+            self.assertEqual(offer["status"], status)
+
+    async def test_payment_while_receipt_is_pending(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        offer = await self.act(offer, "sent", SELLER)
+        offer = await self.act(offer, "settled", SELLER)
+        self.assertEqual(offer["status"], "gift_reported")
+        self.assertEqual(offer["payment_claimed"], 1)
+        self.assertIn("также сообщил", render_text(offer, self.config.name))
+        offer = await self.act(offer, "received", BUYER)
+        self.assertEqual(offer["status"], "completed")
+
+    async def test_buyer_cannot_accept_own_offer_or_confirm_seller_payment(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", BUYER)
+        self.assertEqual(offer["status"], "pending")
+        offer = await self.act(offer, "accept", SELLER)
+        offer = await self.act(offer, "settled", BUYER)
+        self.assertEqual(offer["status"], "accepted")
+        self.assertEqual(offer["payment_claimed"], 0)
+
+    async def test_stranger_cannot_act(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", 333)
+        self.assertEqual(offer["status"], "pending")
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
+
+    async def test_callback_is_bound_to_chat_connection_and_card(self):
+        offer = await self.create_offer()
+        for key, value in [
+            ("chat", {"id": 777}),
+            ("business_connection_id", "another"),
+            ("message_id", 888),
+            ("date", 0),
+        ]:
+            query = self.callback(offer, "accept", SELLER)
+            query["callback_query"]["message"][key] = value
+            await self.service.handle(query)
+            self.assertEqual(self.store.offer(offer["id"])["status"], "pending")
+
+    async def test_repeated_accept_and_stale_reject_do_not_change_offer(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        for action in ("accept", "reject"):
+            offer = await self.act(offer, action, SELLER)
+            self.assertEqual(offer["status"], "accepted")
+        count = self.store.db.execute(
+            "SELECT COUNT(*) FROM events WHERE action='accept'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    async def test_duplicate_source_message_never_sends_second_offer(self):
+        await self.create_offer()
+        await self.create_offer()
+        cards = [
+            params
+            for method, params in self.api.calls
+            if method == "sendMessage" and "business_connection_id" in params
+        ]
+        self.assertEqual(len(cards), 1)
+
+    async def test_creation_deletes_only_command_after_card_has_been_delivered(self):
+        offer = await self.create_offer()
+        sends = [
+            (index, params)
+            for index, (method, params) in enumerate(self.api.calls)
+            if method == "sendMessage" and "business_connection_id" in params
+        ]
+        deletes = [
+            (index, params)
+            for index, (method, params) in enumerate(self.api.calls)
+            if method == "deleteBusinessMessages"
+        ]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(deletes), 1)
+        self.assertGreater(deletes[0][0], sends[0][0])
+        self.assertEqual(
+            deletes[0][1], {"business_connection_id": CONNECTION["id"], "message_ids": [10]}
+        )
+        self.assertNotEqual(offer["card_message_id"], 10)
+        await self.service.handle(
+            {
+                "deleted_business_messages": {
+                    "business_connection_id": CONNECTION["id"],
+                    "chat": {"id": SELLER},
+                    "message_ids": [10],
+                }
+            }
+        )
+        self.assertEqual(self.store.offer(offer["id"])["status"], "pending")
+        self.assertEqual(self.store.offer(offer["id"])["display_enabled"], 1)
+
+    async def test_source_remains_when_delivery_failed_or_is_ambiguous(self):
+        for message_id, failure in [
+            (10, TelegramError(403, "Forbidden")),
+            (11, TransportError("offline")),
+        ]:
+            self.api.failures["sendMessage"] = [failure]
+            offer = await self.create_offer(message_id=message_id)
+            self.assertIsNone(offer["card_message_id"])
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_only_sent_message_permission_cannot_delete_owner_command(self):
+        self.api.connection["rights"] = {"can_reply": True, "can_delete_sent_messages": True}
+        first = await self.create_offer()
+        second = await self.create_offer(message_id=11)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        notices = [
+            params
+            for method, params in self.api.calls
+            if method == "sendMessage" and params["chat_id"] == BUYER
+        ]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("удаление сообщений", notices[0]["text"])
+
+    async def test_deleted_command_failure_does_not_duplicate_or_disable_offer(self):
+        self.api.failures["deleteBusinessMessages"] = [
+            TelegramError(400, "message can't be deleted")
+        ]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "pending")
+        self.assertIsNotNone(offer["card_message_id"])
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        self.assertEqual(
+            sum(
+                method == "sendMessage" and "business_connection_id" in params
+                for method, params in self.api.calls
+            ),
+            1,
+        )
+
+    async def test_temporary_command_deletion_recovers_without_resending_card(self):
+        self.api.failures["deleteBusinessMessages"] = [TransportError("offline")]
+        offer = await self.create_offer()
+        self.now += 31
+        await self.service.tick()
+        self.assertEqual(sum(method == "deleteBusinessMessages" for method, _ in self.api.calls), 2)
+        self.assertEqual(
+            sum(
+                method == "sendMessage" and "business_connection_id" in params
+                for method, params in self.api.calls
+            ),
+            1,
+        )
+        self.assertEqual(self.store.offer(offer["id"])["status"], "pending")
+
+    async def test_connection_rights_refresh_before_another_creation(self):
+        self.api.connection["rights"] = {"can_reply": True}
+        await self.create_offer()
+        self.api.connection["rights"]["can_delete_all_messages"] = True
+        self.now += 61
+        await self.create_offer(message_id=11)
+        self.assertTrue(
+            any(
+                method == "deleteBusinessMessages" and params["message_ids"] == [11]
+                for method, params in self.api.calls
+            )
+        )
+
+    async def test_connection_lookup_failure_preserves_update_for_poll_retry(self):
+        self.api.failures["getBusinessConnection"] = [TransportError("offline")]
+        with self.assertRaises(TransportError):
+            await self.service.handle(self.message())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 0)
+        await self.service.handle(self.message())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 1)
+
+    async def test_incomplete_connection_is_not_cached_or_used_to_create_an_offer(self):
+        self.api.connection = {"id": CONNECTION["id"], "is_enabled": True}
+        with self.assertRaises(TransportError):
+            await self.service.handle(self.message())
+        self.assertNotIn(CONNECTION["id"], self.service.connections)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 0)
+
+    async def test_zero_message_id_does_not_delete_source_or_claim_delivery(self):
+        self.api.counter = -1
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_unknown")
+        self.assertIsNone(offer["card_message_id"])
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_command_cleanup_survives_restart_without_resending_offer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            api = FakeAPI()
+            api.failures["deleteBusinessMessages"] = [TransportError("offline")]
+            service = Service(self.config, store, api, BOT, clock=lambda: self.now)
+            await service.handle(self.message())
+            offer = store.from_source(CONNECTION["id"], SELLER, 10)
+            store.close()
+            self.now += 31
+            reopened = Store(path)
+            try:
+                restarted = Service(self.config, reopened, api, BOT, clock=lambda: self.now)
+                await restarted.tick()
+                self.assertEqual(
+                    sum(method == "deleteBusinessMessages" for method, _ in api.calls), 2
+                )
+                self.assertEqual(
+                    sum(
+                        method == "sendMessage" and "business_connection_id" in params
+                        for method, params in api.calls
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    reopened.offer(offer["id"])["card_message_id"], offer["card_message_id"]
+                )
+                self.assertEqual(reopened.command_cleanups(self.now), [])
+            finally:
+                reopened.close()
+
+    async def test_already_deleted_command_completes_cleanup_without_repeated_requests(self):
+        self.api.failures["deleteBusinessMessages"] = [
+            TelegramError(400, "message to delete not found")
+        ]
+        await self.create_offer()
+        self.now += 120
+        await self.service.tick()
+        self.assertEqual(sum(method == "deleteBusinessMessages" for method, _ in self.api.calls), 1)
+        self.assertEqual(self.store.command_cleanups(self.now), [])
+
+    async def test_old_source_command_is_not_deleted_after_telegram_time_limit(self):
+        update = self.message()
+        update["business_message"]["date"] = self.now - 48 * 3600
+        await self.service.handle(update)
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        self.assertEqual(self.store.command_cleanups(self.now), [])
+
+    async def test_unknown_delivery_is_cleaned_up_only_after_real_callback_recovery(self):
+        self.api.failures["sendMessage"] = [TransportError("offline")]
+        offer = await self.create_offer()
+        await self.service.tick()
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        await self.act(offer, "accept", SELLER)
+        deletions = [
+            params for method, params in self.api.calls if method == "deleteBusinessMessages"
+        ]
+        self.assertEqual(
+            deletions, [{"business_connection_id": CONNECTION["id"], "message_ids": [10]}]
+        )
+
+    async def test_telegram_wire_flow_creates_deletes_updates_and_opens_admin(self):
+        api = Telegram(self.config.token)
+        self.service.api = api
+        requests = []
+        accepted_cards = []
+        state = {"message_id": 100}
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "getBusinessConnection":
+                result = copy.deepcopy(CONNECTION)
+            elif method == "sendMessage":
+                if "business_connection_id" in payload and has_custom_emoji(payload):
+                    error = json.dumps(
+                        {
+                            "ok": False,
+                            "error_code": 400,
+                            "description": "Bad Request: CUSTOM_EMOJI_NOT_ALLOWED",
+                        }
+                    ).encode()
+                    raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(error))
+                state["message_id"] += 1
+                result = {"message_id": state["message_id"]}
+                if "business_connection_id" in payload:
+                    accepted_cards.append(payload)
+            elif method == "editMessageText":
+                result = {"message_id": payload["message_id"]}
+            elif method in {"deleteBusinessMessages", "answerCallbackQuery"}:
+                result = True
+            else:
+                raise AssertionError(f"Unexpected method: {method}")
+            return io.BytesIO(
+                json.dumps({"ok": True, "result": result}, ensure_ascii=False).encode()
+            )
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.create_offer()
+            for action, actor in [
+                ("accept", SELLER),
+                ("confirm_transfer", SELLER),
+                ("confirm_transfer", SELLER),
+            ]:
+                offer = await self.act(offer, action, actor)
+            self.assertEqual(offer["status"], "transfer_confirmed")
+            self.assertEqual(offer["payment_claimed"], 0)
+            gram = await self.create_offer(
+                ".buy https://t.me/nft/DurovsCap-1234 10 gram en", message_id=11
+            )
+            gram = await self.act(gram, "reject", SELLER)
+            self.assertEqual(gram["status"], "rejected")
+            await self.service.handle(self.private("/start"))
+            await self.service.handle(self.private("/ClezzyKryt", message_id=51))
+        self.assertEqual(len(accepted_cards), 2)
+        self.assertIn("⭐", accepted_cards[0]["text"])
+        self.assertIn("💎", accepted_cards[1]["text"])
+        self.assertEqual(
+            [
+                params["message_ids"]
+                for method, params in requests
+                if method == "deleteBusinessMessages"
+            ],
+            [[10], [11]],
+        )
+        edits = [params for method, params in requests if method == "editMessageText"]
+        self.assertTrue(edits)
+        self.assertTrue(all(not has_custom_emoji(params) for params in edits))
+        self.assertTrue(self.store.is_admin(BUYER))
+        self.assertEqual(self.store.audit_stats()["visit"], 1)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
+
+    async def test_invalid_or_incoming_command_is_never_deleted(self):
+        await self.service.handle(self.message(".buy broken"))
+        incoming = self.message(message_id=11)
+        incoming["business_message"]["from"]["id"] = SELLER
+        await self.service.handle(incoming)
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_greeting_has_only_creation_instructions_without_last_offer_commands(self):
+        for language in TEXT:
+            text = help_text(self.config.name, language)
+            self.assertIn(".buy", text)
+            self.assertNotIn(".status", text)
+            self.assertNotIn(".cancel", text)
+        await self.service.handle(self.private("/start"))
+        self.assertNotIn("последнего оффера", self.api.calls[-1][1]["text"])
+        self.assertNotIn("Telegram отклонил", self.api.calls[-1][1]["text"])
+
+    async def test_incoming_or_forwarded_command_is_ignored(self):
+        for changed in [
+            {"from": {"id": SELLER}},
+            {"forward_origin": {"type": "user"}},
+            {"sender_business_bot": {"id": BOT}},
+            {"chat": {"id": -55, "type": "supergroup"}},
+        ]:
+            update = self.message()
+            update["business_message"].update(changed)
+            await self.service.handle(update)
+            self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 0)
+
+    async def test_disabled_connection_blocks_new_offers_and_callbacks(self):
+        offer = await self.create_offer()
+        disabled = copy.deepcopy(CONNECTION)
+        disabled["is_enabled"] = False
+        await self.service.handle({"business_connection": disabled})
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "pending")
+        await self.service.handle(self.message(message_id=20))
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 1)
+
+    async def test_expiry_at_exact_deadline(self):
+        offer = await self.create_offer()
+        self.now = offer["expires_at"]
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "expired")
+        self.assertFalse(
+            any("callback_data" in b for row in keyboard(offer)["inline_keyboard"] for b in row)
+        )
+
+    async def test_acceptance_before_deadline_does_not_expire_mid_trade(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        self.now = offer["expires_at"] + 100
+        await self.service.tick()
+        self.assertEqual(self.store.offer(offer["id"])["status"], "accepted")
+
+    async def test_decline_and_cancel_are_terminal(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "reject", SELLER)
+        self.assertEqual(offer["status"], "rejected")
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "rejected")
+        offer2 = await self.create_offer(message_id=11)
+        offer2 = await self.act(offer2, "cancel", BUYER)
+        self.assertEqual(offer2["status"], "cancelled")
+
+    async def test_cancellation_blocked_after_payment_or_transfer_report(self):
+        for action in ("settled", "sent"):
+            offer = await self.create_offer(message_id=100 if action == "settled" else 101)
+            offer = await self.act(offer, "accept", SELLER)
+            offer = await self.act(offer, action, SELLER)
+            previous = offer["status"]
+            offer = await self.act(offer, "cancel", BUYER)
+            self.assertEqual(offer["status"], previous)
+
+    async def test_ambiguous_send_is_not_repeated_and_can_recover_from_real_callback(self):
+        self.api.failures["sendMessage"] = [TransportError("connection interrupted")]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_unknown")
+        await self.create_offer()
+        sends = [
+            p for m, p in self.api.calls if m == "sendMessage" and "business_connection_id" in p
+        ]
+        self.assertEqual(len(sends), 1)
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        self.assertEqual(offer["card_message_id"], 501)
+
+    async def test_ambiguous_send_cannot_recover_from_another_bots_message(self):
+        self.api.failures["sendMessage"] = [TransportError("connection interrupted")]
+        offer = await self.create_offer()
+        query = self.callback(offer, "accept", SELLER)
+        query["callback_query"]["message"]["sender_business_bot"]["id"] = 555
+        await self.service.handle(query)
+        self.assertEqual(self.store.offer(offer["id"])["status"], "delivery_unknown")
+
+    async def test_known_send_rejection_is_not_a_successful_offer(self):
+        self.api.failures["sendMessage"] = [TelegramError(403, "Forbidden")]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_failed")
+        self.assertIsNone(offer["card_message_id"])
+        self.assertNotIn("Telegram отклонил", self.api.calls[-1][1]["text"])
+
+    async def test_peer_flood_has_specific_diagnosis_keeps_command_and_never_resends(self):
+        self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_failed")
+        self.assertIsNone(offer["card_message_id"])
+        notification = self.api.calls[-1][1]
+        self.assertEqual(notification["chat_id"], BUYER)
+        self.assertIn("PEER_FLOOD", notification["text"])
+        self.assertIn('href="https://t.me/SpamBot"', notification["text"])
+        self.assertIn("Ответ Telegram (400)", notification["text"])
+        self.assertNotIn("право отвечать", notification["text"])
+        await self.create_offer()
+        await self.service.tick()
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        self.assertEqual(
+            sum(
+                method == "sendMessage" and "business_connection_id" in params
+                for method, params in self.api.calls
+            ),
+            1,
+        )
+
+    async def test_actual_delivery_reason_is_escaped_and_token_is_not_sent_to_owner(self):
+        description = "Bad Request: <b>bad payload & field</b> " + self.config.token
+        self.api.failures["sendMessage"] = [TelegramError(400, description)]
+        with self.assertLogs("gift_offer.service", level="WARNING"):
+            await self.create_offer()
+        text = self.api.calls[-1][1]["text"]
+        self.assertIn("Ответ Telegram (400)", text)
+        self.assertIn("&lt;b&gt;bad payload &amp; field&lt;/b&gt;", text)
+        self.assertNotIn("<b>bad payload", text)
+        self.assertNotIn(self.config.token, text)
+        self.assertNotIn("право отвечать", text)
+
+    async def test_peer_flood_notifications_follow_offer_language(self):
+        for index, language in enumerate(TEXT):
+            with self.subTest(language=language):
+                self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+                await self.create_offer(
+                    f".buy https://t.me/nft/CupidCharm-15484 100 stars {language}",
+                    message_id=30 + index,
+                )
+                text = self.api.calls[-1][1]["text"]
+                self.assertIn(TEXT[language]["peer_flood"], text)
+                self.assertIn("PEER_FLOOD", text)
+                self.assertLessEqual(len(text), 4096)
+
+    async def test_failed_card_edit_preserves_state_and_retries(self):
+        offer = await self.create_offer()
+        self.api.failures["editMessageText"] = [TransportError("offline")]
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        self.assertEqual(offer["dirty"], 1)
+        self.now += 31
+        await self.service.tick()
+        self.assertEqual(self.store.offer(offer["id"])["dirty"], 0)
+
+    async def test_incoming_messages_are_observed_without_replying_or_logging_content(self):
+        incoming = self.message("Private text not for the audit log", message_id=20)
+        incoming["business_message"]["from"]["id"] = SELLER
+        incoming["business_message"]["date"] = self.now - 10
+        await self.service.handle(incoming)
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), self.now - 10)
+        self.assertFalse(self.api.calls)
+        self.assertEqual(self.store.audit_page(), [])
+        incoming["business_message"]["date"] = self.now - 50
+        await self.service.handle(incoming)
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), self.now - 10)
+
+    async def test_outgoing_edited_bot_and_invalid_messages_do_not_refresh_incoming_window(self):
+        ordinary = self.message("hello")
+        await self.service.handle(ordinary)
+        incoming = copy.deepcopy(ordinary["business_message"])
+        incoming["from"]["id"] = SELLER
+        await self.service.handle({"edited_business_message": incoming})
+        for extra in [
+            {"from": {"id": SELLER, "is_bot": True}},
+            {"sender_business_bot": {"id": BOT}},
+            {"is_from_offline": True},
+            {"date": self.now + 1},
+            {"date": True},
+            {"date": 0},
+        ]:
+            changed = copy.deepcopy(incoming)
+            changed.update(extra)
+            await self.service.handle({"business_message": changed})
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), 0)
+
+    async def test_peer_flood_diagnosis_distinguishes_unknown_old_and_recent_incoming(self):
+        for index, (timestamp, key) in enumerate(
+            [
+                (0, "incoming_unknown"),
+                (self.now - 86400, "incoming_old"),
+                (self.now - 10, "incoming_recent"),
+            ]
+        ):
+            if timestamp:
+                incoming = self.message("hello", message_id=30 + index)
+                incoming["business_message"]["from"]["id"] = SELLER
+                incoming["business_message"]["date"] = timestamp
+                await self.service.handle(incoming)
+            self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+            offer = await self.create_offer(message_id=40 + index)
+            notice = self.api.calls[-1][1]["text"]
+            self.assertEqual(offer["status"], "delivery_failed")
+            self.assertIn(TEXT["ru"][key], notice)
+            self.assertIn("не доказывает запрет на все сообщения", notice)
+
+    async def test_wire_peer_flood_sends_once_without_edit_fallback_or_command_deletion(self):
+        requests = []
+        self.service.api = Telegram(self.config.token)
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "getBusinessConnection":
+                result = copy.deepcopy(CONNECTION)
+            elif method == "sendMessage" and "business_connection_id" in payload:
+                data = json.dumps(
+                    {"ok": False, "error_code": 400, "description": "Bad Request: PEER_FLOOD"}
+                ).encode()
+                raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(data))
+            elif method == "sendMessage" and payload["chat_id"] == BUYER:
+                result = {"message_id": 700}
+            else:
+                raise AssertionError(f"Unexpected retry or fallback method: {method}")
+            return io.BytesIO(json.dumps({"ok": True, "result": result}).encode())
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.create_offer()
+            await self.service.handle(self.message())
+            self.now += 120
+            await self.service.tick()
+        self.assertEqual(offer["status"], "delivery_failed")
+        self.assertIsNone(offer["card_message_id"])
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(
+            sum(
+                method == "sendMessage" and "business_connection_id" in p for method, p in requests
+            ),
+            1,
+        )
+        self.assertIn(TEXT["ru"]["incoming_unknown"], requests[-1][1]["text"])
+        self.assertIn(
+            "Ответ Telegram (400): <code>Bad Request: PEER_FLOOD</code>", requests[-1][1]["text"]
+        )
+
+    async def test_card_peer_flood_stops_entire_chat_batch_and_later_countdown_retries(self):
+        offers = [await self.create_offer(message_id=i) for i in (10, 11)]
+        self.api.failures["editMessageText"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+        self.now += 60
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertIn(TEXT["ru"]["card_peer_flood"], self.api.calls[-1][1]["text"])
+        for delay in (60, 600, 86400):
+            self.now += delay
+            await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(
+            sum(
+                method == "sendMessage" and "business_connection_id" in p
+                for method, p in self.api.calls
+            ),
+            2,
+        )
+        self.assertTrue(all(self.store.offer(o["id"])["card_message_id"] for o in offers))
+
+    async def test_paused_card_refusal_does_not_record_unperformed_actions(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TelegramError(400, "PEER_FLOOD")]
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+        answers = [p for method, p in self.api.calls if method == "answerCallbackQuery"]
+        self.assertTrue(answers[-1]["show_alert"])
+        self.assertIn(TEXT["ru"]["card_updates_paused"], answers[-1]["text"])
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["message_id"], offer["card_message_id"])
+        self.assertIn(
+            "Ответ Telegram (400): <code>PEER_FLOOD</code>", self.api.calls[-1][1]["text"]
+        )
+
+    async def test_paused_card_recovers_on_valid_click_without_creating_another_offer(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["dirty"], 0)
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 2)
+        self.assertTrue(all(p["message_id"] == offer["card_message_id"] for p in edits))
+        self.assertFalse(
+            any(method in {"sendMessage", "deleteBusinessMessages"} for method, _ in self.api.calls)
+        )
+
+    async def test_paused_card_with_saved_action_refreshes_without_duplicate_audit(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["already_done"])
+
+    async def test_paused_card_unchanged_response_is_an_idempotent_refresh(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TelegramError(400, "message is not modified")]
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+
+    async def test_paused_card_wrong_role_cannot_trigger_refresh(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", BUYER)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["wrong_role"])
+        self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+
+    async def test_paused_card_respects_active_retry_after_before_any_edit(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.store.defer_card_updates(offer["connection_id"], offer["chat_id"], self.now + 120)
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["card_wait"].format(seconds=120))
+        self.now += 120
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+
+    async def test_paused_card_transport_failure_does_not_clear_pause_or_change_state(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TransportError("offline")]
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["card_refresh_unknown"])
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+
+    async def test_paused_card_invalid_success_identifier_does_not_clear_pause(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        original = self.api.call
+        for response in [
+            True,
+            None,
+            {"message_id": str(offer["card_message_id"])},
+            {"message_id": offer["card_message_id"] + 1},
+        ]:
+
+            async def invalid(method, **params):
+                if method == "editMessageText":
+                    return response
+                return await original(method, **params)
+
+            with (
+                self.subTest(response=response),
+                patch.object(self.api, "call", side_effect=invalid),
+            ):
+                result = await self.act(offer, "accept", SELLER)
+            self.assertEqual(result["status"], "pending")
+            self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+
+    async def test_paused_card_recovers_after_restart_on_its_existing_button(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                await service.handle(self.callback(offer, "accept", SELLER))
+                self.assertEqual(restored.offer(offer["id"])["status"], "accepted")
+                self.assertTrue(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertEqual(restored.audit_stats()["offer_accepted"], 1)
+                self.assertFalse(any(method == "sendMessage" for method, _ in api.calls))
+            finally:
+                restored.close()
+
+    async def test_wire_paused_card_restores_accept_and_confirmation_without_resending(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.service.api = Telegram(self.config.token)
+        requests = []
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "editMessageText":
+                self.assertEqual(payload["business_connection_id"], CONNECTION["id"])
+                self.assertEqual(payload["chat_id"], SELLER)
+                self.assertEqual(payload["message_id"], offer["card_message_id"])
+                result = {"message_id": payload["message_id"]}
+            elif method == "answerCallbackQuery":
+                result = True
+            else:
+                raise AssertionError(f"Unexpected send or method during recovery: {method}")
+            return io.BytesIO(json.dumps({"ok": True, "result": result}).encode())
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.act(offer, "accept", SELLER)
+            self.assertEqual(offer["status"], "accepted")
+            offer = await self.act(offer, "confirm_transfer", SELLER)
+            self.assertEqual(offer["status"], "accepted")
+            offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "transfer_confirmed")
+        self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(sum(method == "editMessageText" for method, _ in requests), 3)
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
+
+    async def test_peer_flood_pause_survives_restart_and_incoming_message(self):
+        await self.create_offer()
+        self.api.failures["editMessageText"] = [TelegramError(400, "PEER_FLOOD")]
+        self.now += 60
+        await self.service.tick()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                self.now += 3600
+                await service.tick()
+                incoming = self.message("new incoming", message_id=50)
+                incoming["business_message"]["from"]["id"] = SELLER
+                await service.handle(incoming)
+                self.assertEqual(restored.last_incoming(CONNECTION["id"], SELLER), self.now)
+                self.assertFalse(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertFalse(api.calls)
+                # Only an actual success of an explicitly requested new offer resumes edits.
+                await service.handle(self.message(message_id=51))
+                self.assertTrue(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertEqual(
+                    restored.from_source(CONNECTION["id"], SELLER, 51)["status"], "pending"
+                )
+                self.assertEqual(
+                    sum(
+                        method == "sendMessage" and "business_connection_id" in p
+                        for method, p in api.calls
+                    ),
+                    1,
+                )
+                self.assertTrue(any(method == "editMessageText" for method, _ in api.calls))
+            finally:
+                restored.close()
+
+    async def test_failed_or_ambiguous_new_offer_does_not_resume_card_updates(self):
+        await self.create_offer()
+        self.store.pause_card_updates(CONNECTION["id"], SELLER)
+        for index, error in enumerate(
+            [TelegramError(400, "PEER_FLOOD"), TransportError("offline")]
+        ):
+            self.api.failures["sendMessage"] = [error]
+            await self.create_offer(message_id=20 + index)
+            self.now += 120
+            await self.service.tick()
+            self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+            self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+
+    async def test_send_peer_flood_pauses_existing_cards_but_does_not_block_other_chats(self):
+        await self.create_offer()
+        self.api.failures["sendMessage"] = [TelegramError(400, "PEER_FLOOD")]
+        await self.create_offer(message_id=11)
+        other = self.message(message_id=12)
+        other["business_message"]["chat"]["id"] = SELLER + 1
+        await self.service.handle(other)
+        self.now += 60
+        await self.service.tick()
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["chat_id"], SELLER + 1)
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+
+    async def test_card_rate_limit_waits_full_delay_for_all_cards_in_same_chat(self):
+        for message_id in (10, 11):
+            await self.create_offer(message_id=message_id)
+        self.api.failures["editMessageText"] = [TelegramError(429, "Too Many Requests", 120)]
+        self.now += 60
+        await self.service.tick()
+        self.now += 119
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.now += 1
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 3)
+        self.assertTrue(
+            all(o["dirty"] == 0 for o in self.store.db.execute("SELECT dirty FROM offers"))
+        )
+
+    async def test_card_rate_limit_persists_and_uses_time_of_final_refusal(self):
+        await self.create_offer()
+        self.api.failures["editMessageText"] = [TelegramError(429, "Too Many Requests", 120)]
+        original = self.api.call
+
+        async def delayed(method, **params):
+            if method == "editMessageText":
+                self.now += 30  # Simulate time spent waiting inside the transport.
+            return await original(method, **params)
+
+        self.now += 60
+        with patch.object(self.api, "call", side_effect=delayed):
+            await self.service.tick()
+        final_refusal_at = self.now
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                self.now = final_refusal_at + 119
+                await service.tick()
+                self.assertFalse(api.calls)
+                self.now += 1
+                await service.tick()
+                self.assertEqual(sum(method == "editMessageText" for method, _ in api.calls), 1)
+            finally:
+                restored.close()
+
+    async def test_paused_cards_do_not_starve_other_chats_at_batch_limit(self):
+        for message_id in range(100, 131):
+            await self.create_offer(message_id=message_id)
+        self.store.pause_card_updates(CONNECTION["id"], SELLER)
+        other = self.message(message_id=140)
+        other["business_message"]["chat"]["id"] = SELLER + 1
+        await self.service.handle(other)
+        self.now += 60
+        await self.service.tick()
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["chat_id"], SELLER + 1)
+
+    async def test_deleted_card_cannot_be_used(self):
+        offer = await self.create_offer()
+        await self.service.handle(
+            {
+                "deleted_business_messages": {
+                    "business_connection_id": offer["connection_id"],
+                    "chat": {"id": SELLER},
+                    "message_ids": [offer["card_message_id"]],
+                }
+            }
+        )
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "cancelled")
+        self.assertEqual(offer["display_enabled"], 0)
+
+    async def test_status_is_private_to_owner_and_confined_to_original_chat(self):
+        offer = await self.create_offer()
+        await self.service.handle(self.message(".status", message_id=11))
+        self.assertEqual(self.api.calls[-1][1]["chat_id"], BUYER)
+        self.assertIn(offer["gift_name"], self.api.calls[-1][1]["text"])
+        self.assertNotIn(offer["id"], self.api.calls[-1][1]["text"])
+
+    async def test_all_language_and_state_cards_fit_telegram_limits(self):
+        offer = await self.create_offer()
+        self.store.set_setting("gift_recipient_username", "real_buyer")
+        keys = set(TEXT["ru"])
+        for language in TEXT:
+            self.assertEqual(set(TEXT[language]), keys)
+            offer["language"] = language
+            for status in (
+                "pending",
+                "accepted",
+                "payment_reported",
+                "gift_reported",
+                "gift_received",
+                "transfer_confirmed",
+                "completed",
+                "rejected",
+                "cancelled",
+                "expired",
+            ):
+                offer["status"] = status
+                payload = card_payload(offer, self.config.name, recipient_username="real_buyer")
+                self.assertLessEqual(len(payload["text"]), 4096)
+                self.assertFalse(payload["link_preview_options"]["is_disabled"])
+                self.assertEqual(payload["link_preview_options"]["url"], offer["gift_url"])
+                self.assertTrue(payload["link_preview_options"]["prefer_large_media"])
+                self.assertFalse(payload["link_preview_options"]["show_above_text"])
+                for row in payload["reply_markup"]["inline_keyboard"]:
+                    for button in row:
+                        self.assertLessEqual(len(button.get("callback_data", "").encode()), 64)
+                        action = button.get("callback_data", "").rsplit(":", 1)[-1]
+                        expected_icon = (
+                            NEGATIVE_EMOJI_ID
+                            if action in {"reject", "cancel"}
+                            else POSITIVE_EMOJI_ID
+                        )
+                        self.assertEqual(button["icon_custom_emoji_id"], expected_icon)
+                self.assertNotIn(TEXT[language]["disclosure"], payload["text"])
+                rows = payload["reply_markup"]["inline_keyboard"]
+                if status == "pending":
+                    self.assertEqual(
+                        [[b["callback_data"].rsplit(":", 1)[-1] for b in row] for row in rows],
+                        [["reject", "accept"]],
+                    )
+                elif status in {"accepted", "payment_reported", "gift_reported", "gift_received"}:
+                    self.assertEqual(len(rows), 2)
+                    self.assertEqual(rows[0][0]["url"], "tg://send_gift?to=real_buyer")
+                    self.assertEqual(
+                        rows[1][0]["callback_data"].rsplit(":", 1)[-1], "confirm_transfer"
+                    )
+                else:
+                    self.assertEqual(rows, [])
+            self.assertLessEqual(len(help_text(self.config.name, language)), 4096)
+            self.assertNotIn(TEXT[language]["disclosure"], help_text(self.config.name, language))
+
+    async def test_html_names_cannot_inject_recipient_links(self):
+        self.api.connection["user"]["first_name"] = '<a href="https://evil.test">Fake</a>'
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        text = render_text(offer, "<unsafe>")
+        self.assertNotIn('<a href="https://evil.test">', text)
+        self.assertNotIn("Fake", text)
+
+    async def test_offer_caption_uses_actual_price_gift_and_remaining_time(self):
+        offer = await self.create_offer()
+        text = render_text(offer, self.config.name, now=self.now)
+        self.assertTrue(text.startswith("Пользователь ") and " предлагает Вам\n<b>8900</b>" in text)
+        self.assertIn("Звёзд за подарок", text)
+        self.assertIn(offer["gift_name"], text)
+        self.assertIn("Предложение действует ещё 6 ч. 0 мин..", text)
+        self.assertNotIn("UTC", text)
+        later = render_text(offer, self.config.name, now=self.now + 3661)
+        self.assertIn("4 ч. 59 мин..", later)
+        short = {**offer, "expires_at": self.now + 50}
+        self.assertIn("0 ч. 1 мин..", render_text(short, self.config.name, now=self.now))
+        gram = await self.create_offer(
+            ".buy https://t.me/nft/DurovsCap-1234 10.5 gram", message_id=11
+        )
+        gram_text = render_text(gram, self.config.name, now=self.now)
+        self.assertIn("<b>10.5</b>", gram_text)
+        self.assertIn("GRAM за подарок", gram_text)
+        self.assertNotIn("8900", gram_text)
+        self.assertIn(gram["gift_name"], gram_text)
+
+    async def test_countdown_edits_only_confirmed_card_once_per_minute_and_expires(self):
+        offer = await self.create_offer()
+        initial_sends = sum(method == "sendMessage" for method, _ in self.api.calls)
+        self.now += 61
+        await self.service.tick()
+        edits = [params for method, params in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["message_id"], offer["card_message_id"])
+        self.assertNotEqual(edits[0]["message_id"], offer["source_message_id"])
+        self.assertIn("5 ч. 59 мин..", edits[0]["text"])
+        self.now += 10
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(
+            sum(method == "sendMessage" for method, _ in self.api.calls), initial_sends
+        )
+        self.now = offer["expires_at"]
+        await self.service.tick()
+        self.assertEqual(self.store.offer(offer["id"])["status"], "expired")
+        final = [params for method, params in self.api.calls if method == "editMessageText"][-1]
+        self.assertEqual(final["reply_markup"]["inline_keyboard"], [])
+        self.assertNotIn("действует ещё", final["text"])
+
+    async def test_transfer_link_uses_admin_recipient_and_rejects_injection(self):
+        offer = await self.create_offer()
+        self.assertEqual(transfer_url(offer, "woutb"), "tg://send_gift?to=woutb")
+        self.assertIsNone(transfer_url(offer, ""))
+        for username in ("real_buyer&to=attacker", "real_buyer?to=attacker", "../attacker"):
+            self.assertIsNone(transfer_url(offer, username))
+        self.assertEqual(self.store.audit_page("transfers"), [])
+
+    async def test_new_connected_owner_can_create_without_manual_configuration(self):
+        self.api.connection["user"]["id"] = 333
+        update = self.message()
+        update["business_message"]["from"]["id"] = 333
+        await self.service.handle(update)
+        offer = self.store.from_source(CONNECTION["id"], SELLER, 10)
+        self.assertEqual(offer["buyer_id"], 333)
+        self.assertEqual(offer["status"], "pending")
+
+    async def test_status_and_cancel_choose_latest_offer_without_ids(self):
+        old = await self.create_offer(message_id=10)
+        newest = await self.create_offer(
+            ".buy https://t.me/nft/DurovsCap-1234 500 stars", message_id=11
+        )
+        await self.service.handle(self.message(".status", message_id=12))
+        self.assertIn(newest["gift_url"], self.api.calls[-1][1]["text"])
+        await self.service.handle(self.message(".cancel", message_id=13))
+        self.assertEqual(self.store.offer(newest["id"])["status"], "cancelled")
+        self.assertEqual(self.store.offer(old["id"])["status"], "pending")
+
+    async def test_visits_count_start_messages_and_deduplicate_redelivery(self):
+        first = self.private("/start", actor=333, message_id=1)
+        await self.service.handle(first)
+        await self.service.handle(first)
+        await self.service.handle(self.private("/start", actor=333, message_id=2))
+        await self.service.handle(self.private("/start", actor=444, message_id=1))
+        await self.service.handle(self.private("/help", actor=555, message_id=1))
+        stats = self.store.audit_stats()
+        self.assertEqual(stats["visit"], 3)
+        self.assertEqual(stats["unique_visitors"], 2)
+
+    async def test_promo_activates_admin_for_connected_account_without_id_setup(self):
+        await self.activate()
+        self.assertTrue(self.store.is_admin(BUYER))
+        self.assertIn("Админ-панель", self.api.calls[-1][1]["text"])
+        audit = self.store.audit_page()
+        self.assertEqual(audit[0]["kind"], "admin_activation")
+        self.assertNotIn("ClezzyKryt", str(audit))
+
+    async def test_unconnected_user_cannot_claim_admin(self):
+        await self.service.handle(self.private("/ClezzyKryt", actor=333))
+        self.assertFalse(self.store.is_admin(333))
+        self.assertEqual(self.store.get_setting("admin_user", ""), "")
+        self.assertIn("подключи бота", self.api.calls[-1][1]["text"])
+
+    async def test_admin_binding_cannot_be_taken_over_with_same_promo(self):
+        await self.activate()
+        connection = copy.deepcopy(CONNECTION)
+        connection["id"] = "another-connection"
+        connection["user"]["id"] = 333
+        await self.service.handle({"business_connection": connection})
+        await self.service.handle(self.private("/ClezzyKryt", actor=333))
+        self.assertTrue(self.store.is_admin(BUYER))
+        self.assertFalse(self.store.is_admin(333))
+        self.assertIn("другим аккаунтом", self.api.calls[-1][1]["text"])
+
+    async def test_repeated_promo_does_not_duplicate_activation(self):
+        await self.activate()
+        await self.service.handle(self.private("/clezzykryt", message_id=51))
+        self.assertEqual(self.store.audit_stats()["admin_activation"], 1)
+
+    async def test_forwarded_promo_never_grants_admin(self):
+        await self.service.handle({"business_connection": copy.deepcopy(CONNECTION)})
+        update = self.private("/ClezzyKryt")
+        update["message"]["forward_origin"] = {"type": "user"}
+        await self.service.handle(update)
+        self.assertFalse(self.store.is_admin(BUYER))
+
+    async def test_non_admin_cannot_read_log_commands(self):
+        await self.activate()
+        for command in ("/admin", "/logs", "/visits", "/transfers"):
+            await self.service.handle(self.private(command, actor=333))
+            self.assertEqual(
+                self.api.calls[-1][1]["text"], "Этот раздел доступен только администратору."
+            )
+
+    async def test_transfer_statement_logs_real_sender_recipient_and_nft(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        await self.act(offer, "sent", SELLER)
+        rows = self.store.audit_page("transfers")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["actor_id"], rows[0]["recipient_id"]), (SELLER, BUYER))
+        self.assertEqual(rows[0]["gift_url"], offer["gift_url"])
+        self.assertEqual(rows[0]["evidence"], "user_statement")
+        self.assertEqual(self.store.audit_stats().get("telegram_transfer", 0), 0)
+        await self.activate()
+        await self.service.handle(self.private("/transfers", message_id=51))
+        text = self.api.calls[-1][1]["text"]
+        self.assertIn("@seller_user", text)
+        self.assertIn("@real_buyer", text)
+        self.assertIn("заявление участника", text)
+        self.assertNotIn(offer["id"], text)
+
+    def gift_update(self, sender: int, message_id: int = 60) -> dict:
+        update = self.message("", message_id=message_id)
+        update["business_message"]["from"] = {"id": sender, "first_name": "Sender"}
+        update["business_message"]["unique_gift"] = {
+            "origin": "transfer",
+            "gift": {"name": "CupidCharm-15484", "base_name": "Cupid Charm", "number": 15484},
+        }
+        return update
+
+    async def test_event_notifications_use_separate_topics_without_duplicates(self):
+        group_id = -1004472217336
+        self.service.config = replace(
+            self.config,
+            event_chat_id=group_id,
+            nft_transfer_thread_id=13,
+            new_offer_thread_id=15,
+        )
+        self.api.connection["user"]["first_name"] = "Buyer & Co"
+        for update in (self.message(), self.gift_update(SELLER)):
+            await self.service.handle(update)
+            await self.service.handle(update)
+
+        sends = [payload for method, payload in self.api.calls if method == "sendMessage"]
+        self.assertEqual([payload["chat_id"] for payload in sends], [SELLER, group_id, group_id])
+        self.assertNotIn("message_thread_id", sends[0])
+        self.assertEqual([payload["message_thread_id"] for payload in sends[1:]], [15, 13])
+        self.assertTrue(all("business_connection_id" not in payload for payload in sends[1:]))
+        gift_url = "https://t.me/nft/CupidCharm-15484"
+        offer_text, transfer_text = (payload["text"] for payload in sends[1:])
+        self.assertIn("новый Лог!", offer_text)
+        self.assertIn("@seller_user", offer_text)
+        self.assertIn("Покупатель: Buyer &amp; Co", offer_text)
+        self.assertIn(f"предмет: {gift_url}", offer_text)
+        self.assertIn("Сервис: оффери", offer_text)
+        self.assertNotIn("%", offer_text)
+        self.assertEqual(sends[1]["link_preview_options"], sends[0]["link_preview_options"])
+        self.assertIn("Найден новый коллекционный предмет!", transfer_text)
+        self.assertIn("Название: Cupid Charm #15484", transfer_text)
+        self.assertIn("Работник: Sender", transfer_text)
+        self.assertIn(f"Ссылка: {gift_url}", transfer_text)
+        self.assertTrue(sends[2]["link_preview_options"]["is_disabled"])
+
+    async def test_failed_topic_send_keeps_the_transfer_in_the_journal(self):
+        self.service.config = replace(
+            self.config, event_chat_id=-1004472217336, nft_transfer_thread_id=13
+        )
+        self.api.failures["sendMessage"] = [TransportError("offline")]
+        update = self.gift_update(SELLER)
+        with self.assertLogs("gift_offer.service", level="WARNING"):
+            await self.service.handle(update)
+        await self.service.handle(update)
+
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
+        self.assertEqual(sum(method == "sendMessage" for method, _ in self.api.calls), 1)
+
+    async def test_telegram_transfer_incoming_is_separate_and_deduplicated(self):
+        update = self.gift_update(SELLER)
+        update["business_message"]["unique_gift"]["owned_gift_id"] = (
+            "gift-owned-by-business-account"
+        )
+        await self.service.handle(update)
+        await self.service.handle(update)
+        rows = self.store.audit_page("transfers")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["actor_id"], rows[0]["recipient_id"]), (SELLER, BUYER))
+        self.assertEqual(rows[0]["evidence"], "telegram_service")
+
+    async def test_telegram_transfer_outgoing_logs_actual_peer(self):
+        update = self.gift_update(BUYER)
+        update["business_message"]["sender_business_bot"] = {"id": BOT}
+        await self.service.handle(update)
+        rows = self.store.audit_page("transfers")
+        self.assertEqual((rows[0]["actor_id"], rows[0]["recipient_id"]), (BUYER, SELLER))
+
+    async def test_upgrade_forward_or_unknown_sender_is_not_a_transfer_record(self):
+        for change in ("upgrade", "forward", "unknown_sender"):
+            update = self.gift_update(SELLER)
+            if change == "upgrade":
+                update["business_message"]["unique_gift"]["origin"] = "upgrade"
+            elif change == "forward":
+                update["business_message"]["forward_origin"] = {"type": "user"}
+            else:
+                update["business_message"]["from"]["id"] = 888
+            await self.service.handle(update)
+        self.assertEqual(self.store.audit_page("transfers"), [])
+
+    async def test_log_filters_and_cursor_paging_do_not_skip_or_duplicate(self):
+        for message_id in range(1, 13):
+            await self.service.handle(self.private("/start", actor=333, message_id=message_id))
+        await self.activate()
+        latest = self.store.audit_page("visits", limit=5)
+        older = self.store.audit_page("visits", before=latest[-1]["id"], limit=5)
+        self.assertTrue(set(r["id"] for r in latest).isdisjoint(set(r["id"] for r in older)))
+        self.assertTrue(all(r["kind"] == "visit" for r in latest + older))
+        self.assertEqual(len(self.store.audit_page("transfers")), 0)
+
+    async def test_admin_callback_cannot_be_used_by_stranger_or_in_business_chat(self):
+        await self.activate()
+        for changed in ("stranger", "business", "forward", "different_chat"):
+            query = {
+                "callback_query": {
+                    "id": "admin-query",
+                    "data": "a:visits:0",
+                    "from": {"id": BUYER},
+                    "message": {
+                        "message_id": 600,
+                        "date": self.now,
+                        "from": {"id": BOT},
+                        "chat": {"id": BUYER, "type": "private"},
+                    },
+                }
+            }
+            if changed == "stranger":
+                query["callback_query"]["from"]["id"] = 333
+            elif changed == "business":
+                query["callback_query"]["message"]["business_connection_id"] = CONNECTION["id"]
+            elif changed == "forward":
+                query["callback_query"]["message"]["forward_origin"] = {"type": "user"}
+            else:
+                query["callback_query"]["message"]["chat"]["id"] = 333
+            before = len([m for m, _ in self.api.calls if m == "editMessageText"])
+            await self.service.handle(query)
+            after = len([m for m, _ in self.api.calls if m == "editMessageText"])
+            self.assertEqual(before, after)
+            self.assertTrue(self.api.calls[-1][1]["show_alert"])
+
+    async def test_authorized_admin_callback_opens_logs(self):
+        await self.activate()
+        await self.service.handle(self.private("/start", actor=333, message_id=1))
+        await self.service.handle(
+            {
+                "callback_query": {
+                    "id": "admin-query",
+                    "data": "a:visits:0",
+                    "from": {"id": BUYER},
+                    "message": {
+                        "message_id": 600,
+                        "date": self.now,
+                        "from": {"id": BOT},
+                        "chat": {"id": BUYER, "type": "private"},
+                    },
+                }
+            }
+        )
+        method, params = self.api.calls[-1]
+        self.assertEqual(method, "editMessageText")
+        self.assertIn("@visitor_user", params["text"])
+        self.assertEqual(params["chat_id"], BUYER)
+
+    async def test_admin_callback_overflow_does_not_query_sqlite(self):
+        await self.activate()
+        await self.service.handle(
+            {
+                "callback_query": {
+                    "id": "admin-query",
+                    "data": "a:all:9999999999999999999",
+                    "from": {"id": BUYER},
+                    "message": {
+                        "message_id": 600,
+                        "date": self.now,
+                        "from": {"id": BOT},
+                        "chat": {"id": BUYER, "type": "private"},
+                    },
+                }
+            }
+        )
+        self.assertIn("Неизвестная страница", self.api.calls[-1][1]["text"])
+
+    async def test_old_numeric_id_commands_are_not_needed_or_exposed(self):
+        offer = await self.create_offer()
+        self.assertNotIn(offer["id"], render_text(offer, self.config.name))
+        for language in TEXT:
+            text = help_text(self.config.name, language)
+            self.assertNotIn("OWNER_IDS", text)
+            self.assertNotIn(".status ID", text)
+            self.assertNotIn(".cancel ID", text)
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_upgrade_does_not_delete_historical_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            now = 1800000000
+            offer = store.create(
+                parse_buy(".buy https://t.me/nft/Gift-1 500 stars"),
+                CONNECTION,
+                {"message_id": 10, "chat": {"id": SELLER}},
+                now,
+                21600,
+            )
+            store.attach_card(offer["id"], 101)
+            with store.db:
+                store.db.execute("DROP TABLE command_cleanup")
+            store.close()
+            upgraded = Store(path)
+            try:
+                self.assertEqual(upgraded.command_cleanups(now), [])
+                self.assertEqual(upgraded.offer(offer["id"])["card_message_id"], 101)
+            finally:
+                upgraded.close()
+
+    def test_restart_retains_offer_events_and_poll_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            spec = parse_buy(".buy https://t.me/nft/Gift-1 500 stars")
+            offer = store.create(
+                spec, CONNECTION, {"chat": {"id": SELLER}, "message_id": 10}, 1000, 21600
+            )
+            store.attach_card(offer["id"], 99)
+            store.transition(offer["id"], "accept", SELLER, 1001)
+            store.set_setting("offset", "77")
+            store.claim_admin(BUYER, 1002, "admin:first")
+            store.close()
+            store = Store(path)
+            self.assertEqual(store.offer(offer["id"])["status"], "accepted")
+            self.assertEqual(store.get_setting("offset"), "77")
+            self.assertTrue(store.is_admin(BUYER))
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 2)
+            store.close()
+
+    def test_interrupted_send_is_never_silently_resubmitted_after_restart(self):
+        store = Store(":memory:")
+        offer = store.create(
+            parse_buy(".buy https://t.me/nft/Gift-1 500 stars"),
+            CONNECTION,
+            {"chat": {"id": SELLER}, "message_id": 10},
+            1000,
+            21600,
+        )
+        store.recover_interrupted_sends(1001)
+        self.assertEqual(store.offer(offer["id"])["status"], "delivery_unknown")
+        store.close()
+
+    def test_upgrade_imports_old_offer_events_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            offer = store.create(
+                parse_buy(".buy https://t.me/nft/Gift-1 500 stars"),
+                CONNECTION,
+                {"chat": {"id": SELLER}, "message_id": 10},
+                1000,
+                21600,
+            )
+            store.transition(offer["id"], "accept", SELLER, 1001)
+            store.transition(offer["id"], "sent", SELLER, 1002)
+            store.attach_card(offer["id"], 900)
+            # Simulate the 1.0 schema with no audit tables or backfill marker.
+            store.db.executescript(
+                "DROP TABLE audit_log; DROP TABLE users; DELETE FROM settings WHERE key='audit_backfill';"
+            )
+            store.close()
+            store = Store(path)
+            self.assertEqual(len(store.audit_page("transfers")), 1)
+            self.assertEqual(store.offer(offer["id"])["status"], "gift_reported")
+            self.assertEqual(store.offer(offer["id"])["dirty"], 1)
+            count = len(store.audit_page())
+            store.close()
+            store = Store(path)
+            self.assertEqual(len(store.audit_page()), count)
+            store.close()
+
+
+class WebhookAPI:
+    def __init__(self, url="https://example.test/private-hook"):
+        self.url = url
+        self.pending = [{"update_id": 7, "message": {"text": "/start"}}]
+        self.calls = []
+        self.delete_error = None
+        self.delete_result = True
+        self.reactivate = False
+
+    async def call(self, method, **params):
+        self.calls.append((method, params))
+        if method == "getWebhookInfo":
+            return {"url": self.url}
+        if method == "deleteWebhook":
+            if self.delete_error:
+                raise self.delete_error
+            if self.delete_result:
+                self.url = self.url if self.reactivate else ""
+                if params.get("drop_pending_updates"):
+                    self.pending.clear()
+            return self.delete_result
+        if method == "getUpdates":
+            if self.url:
+                raise TelegramError(409, "Cannot use getUpdates while webhook is active")
+            return copy.deepcopy(self.pending)
+        raise AssertionError(method)
+
+
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switch_to_polling_preserves_pending_updates_and_hides_webhook_url(self):
+        api = WebhookAPI()
+        original_url, pending = api.url, copy.deepcopy(api.pending)
+        with self.assertRaises(TelegramError):
+            await api.call("getUpdates")
+        with self.assertLogs("gift_offer", level="INFO") as logs:
+            await ensure_polling(api)
+        self.assertEqual(await api.call("getUpdates"), pending)
+        self.assertNotIn(original_url, "\n".join(logs.output))
+
+    async def test_already_polling_keeps_updates_without_deleting_webhook(self):
+        api = WebhookAPI(url="")
+        await ensure_polling(api)
+        self.assertEqual([method for method, _ in api.calls], ["getWebhookInfo"])
+        self.assertEqual(await api.call("getUpdates"), api.pending)
+
+    async def test_api_rejection_keeps_webhook_and_pending_updates(self):
+        api = WebhookAPI()
+        original_url, pending = api.url, copy.deepcopy(api.pending)
+        api.delete_error = TelegramError(401, "Unauthorized")
+        with self.assertRaises(TelegramError):
+            await ensure_polling(api)
+        self.assertEqual(api.url, original_url)
+        self.assertEqual(api.pending, pending)
+
+    async def test_reactivated_webhook_stops_instead_of_repeatedly_deleting(self):
+        api = WebhookAPI()
+        api.reactivate = True
+        with self.assertRaisesRegex(RuntimeError, "Остановите другой сервис"):
+            await ensure_polling(api)
+        self.assertEqual(sum(method == "deleteWebhook" for method, _ in api.calls), 1)
+        with self.assertRaises(TelegramError):
+            await api.call("getUpdates")
+
+    async def test_unconfirmed_deletion_stops_startup(self):
+        api = WebhookAPI()
+        api.delete_result = False
+        with self.assertRaisesRegex(RuntimeError, "не подтвердил отключение"):
+            await ensure_polling(api)
+        self.assertTrue(api.url)
+        self.assertTrue(api.pending)
+
+
+class HealthTests(unittest.TestCase):
+    def test_liveness_during_startup_and_readiness_after_polling(self):
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        health = {"ready": False, "last_poll": time.time()}
+        server = health_server(port, health)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(server.server_address[0], "0.0.0.0")
+
+        def request(path, method="GET"):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                connection.request(method, path)
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        status, body = request("/health")
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["ready"])
+        self.assertEqual(request("/readyz")[0], 503)
+        self.assertEqual(request("/health", "HEAD"), (200, b""))
+        health["ready"] = True
+        self.assertEqual(request("/readyz")[0], 200)
+        health["last_poll"] = 0
+        self.assertEqual(request("/health")[0], 200)
+        self.assertEqual(request("/healthz")[0], 503)
+        self.assertEqual(request("/missing")[0], 404)
+
+    def test_optional_http_server_can_be_disabled(self):
+        self.assertIsNone(health_server(0, {"ready": False, "last_poll": 0}))
+
+
+class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permanent_reply_failure_does_not_block_another_update(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        stop = asyncio.Event()
+        handled = []
+
+        async def api_call(method, **params):
+            if handled:
+                stop.set()  # Also keeps this regression test bounded if polling breaks.
+                return []
+            return [{"update_id": 11}, {"update_id": 12}]
+
+        async def handle(update):
+            handled.append(update["update_id"])
+            if update["update_id"] == 11:
+                raise TelegramError(403, "bot was blocked by the user")
+            stop.set()
+
+        service = SimpleNamespace(store=store, api=SimpleNamespace(call=api_call), handle=handle)
+        with patch("bot.wait_or_stop", new=AsyncMock()):
+            await poll(service, stop, {"ready": True, "last_poll": 0})
+        self.assertEqual(handled, [11, 12])
+        self.assertEqual(store.get_setting("offset"), "13")
+
+    async def test_temporary_processing_failure_keeps_offset_and_recovers(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        stop = asyncio.Event()
+        offsets, handled = [], []
+
+        async def api_call(method, **params):
+            offsets.append(params["offset"])
+            self.assertLessEqual(len(offsets), 2)
+            return [{"update_id": 11}]
+
+        async def handle(update):
+            handled.append(update["update_id"])
+            if len(handled) == 1:
+                raise TransportError("offline")
+            stop.set()
+
+        service = SimpleNamespace(store=store, api=SimpleNamespace(call=api_call), handle=handle)
+        with patch("bot.wait_or_stop", new=AsyncMock()):
+            await poll(service, stop, {"ready": True, "last_poll": 0})
+        self.assertEqual(offsets, [0, 0])
+        self.assertEqual(handled, [11, 11])
+        self.assertEqual(store.get_setting("offset"), "12")
+
+    async def test_hosting_starts_health_before_network_and_survives_temporary_failure(self):
+        attempts = 0
+        api = SimpleNamespace(call=AsyncMock())
+
+        async def api_call(method, **params):
+            nonlocal attempts
+            self.assertTrue(http_server.called)
+            if method == "getMe":
+                attempts += 1
+                if attempts == 1:
+                    raise TransportError("temporary connection failure")
+                return {"id": BOT, "username": "test_bot", "can_connect_to_business": True}
+            if method == "getWebhookInfo":
+                return {"url": ""}
+            if method == "setMyCommands":
+                raise TelegramError(400, "Menu unavailable")
+            raise AssertionError(method)
+
+        async def fast_wait(stop, seconds):
+            await asyncio.sleep(0)
+
+        async def first_poll(service, stop, health):
+            self.assertTrue(health["ready"])
+            self.assertEqual(service.config.admin_promo, "/ClezzyKryt")
+            stop.set()
+
+        api.call.side_effect = api_call
+        config = Config(token="123456:" + "X" * 30, db_path=":memory:", port=0)
+        with (
+            patch("bot.health_server") as http_server,
+            patch("bot.Telegram", return_value=api),
+            patch("bot.wait_or_stop", side_effect=fast_wait),
+            patch("bot.poll", side_effect=first_poll) as poller,
+        ):
+            await asyncio.wait_for(run(config), timeout=3)
+            self.assertEqual(attempts, 2)
+            poller.assert_awaited_once()
+            http_server.return_value.shutdown.assert_called_once()
+            http_server.return_value.server_close.assert_called_once()
+
+    async def test_invalid_token_is_not_retried_forever(self):
+        api = SimpleNamespace(call=AsyncMock(side_effect=TelegramError(401, "Unauthorized")))
+        with patch("bot.wait_or_stop") as wait:
+            with self.assertRaises(TelegramError):
+                await connect_to_telegram(api, asyncio.Event())
+            wait.assert_not_called()
+
+    async def test_temporary_polling_conflict_preserves_offset_and_recovers(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        store.set_setting("offset", "66")
+        stop = asyncio.Event()
+        calls = []
+
+        async def api_call(method, **params):
+            calls.append(params)
+            if len(calls) == 1:
+                raise TelegramError(409, "terminated by other getUpdates request")
+            return [{"update_id": 77}]
+
+        async def handle(update):
+            stop.set()
+
+        async def fast_wait(event, seconds):
+            self.assertEqual(store.get_setting("offset"), "66")
+
+        service = SimpleNamespace(store=store, api=SimpleNamespace(call=api_call), handle=handle)
+        with patch("bot.wait_or_stop", side_effect=fast_wait):
+            await poll(service, stop, {"ready": True, "last_poll": 0})
+        self.assertEqual([p["offset"] for p in calls], [66, 66])
+        self.assertEqual(store.get_setting("offset"), "78")
+
+    async def test_persistent_polling_conflict_stops_with_clear_error(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        api = SimpleNamespace(
+            call=AsyncMock(side_effect=TelegramError(409, "other getUpdates request"))
+        )
+        service = SimpleNamespace(store=store, api=api)
+        with patch("bot.wait_or_stop", new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, "Остановите вторую копию"):
+                await poll(service, asyncio.Event(), {"ready": True, "last_poll": 0})
+        self.assertEqual(api.call.await_count, 7)
+        self.assertEqual(store.get_setting("offset"), "0")
+
+
+class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limit_waits_for_the_full_server_delay(self):
+        api = Telegram("123456:" + "X" * 30)
+        with (
+            patch.object(
+                api, "_call", side_effect=[TelegramError(429, "Too Many Requests", 120), True]
+            ),
+            patch("gift_offer.telegram.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            self.assertTrue(
+                await api.call("getBusinessConnection", business_connection_id=CONNECTION["id"])
+            )
+        sleep.assert_awaited_once_with(120)
+
+    async def test_explicit_peer_flood_takes_priority_over_emoji_and_retry_markers(self):
+        api = Telegram("123456:" + "X" * 30)
+        for code in (400, 429, 500):
+            with (
+                self.subTest(code=code),
+                patch.object(
+                    api,
+                    "_call",
+                    side_effect=TelegramError(code, "PEER_FLOOD CUSTOM_EMOJI_NOT_ALLOWED", 60),
+                ) as request,
+                patch("gift_offer.telegram.asyncio.sleep", new=AsyncMock()) as sleep,
+            ):
+                with self.assertRaises(TelegramError):
+                    await api.call("editMessageText", message_id=101, **self.decorated_params())
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_awaited()
+
+    async def test_bad_api_shapes_become_transport_errors_without_repeated_send(self):
+        api = Telegram("123456:" + "X" * 30)
+        for response in [b"[]", b'{"ok":true}', b'{"ok":"yes","result":{}}']:
+            with (
+                self.subTest(response=response),
+                patch("gift_offer.telegram.urlopen", return_value=io.BytesIO(response)) as http,
+            ):
+                with self.assertRaises(TransportError):
+                    await api.call("sendMessage", chat_id=SELLER, text="Offer")
+                self.assertEqual(http.call_count, 1)
+
+    def decorated_params(self):
+        return {
+            "business_connection_id": CONNECTION["id"],
+            "chat_id": SELLER,
+            "parse_mode": "HTML",
+            "text": f'500 <tg-emoji emoji-id="{STARS_EMOJI_ID}">⭐</tg-emoji>',
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Отклонить",
+                            "callback_data": "g:test:reject",
+                            "icon_custom_emoji_id": NEGATIVE_EMOJI_ID,
+                        },
+                        {
+                            "text": "Принять",
+                            "callback_data": "g:test:accept",
+                            "icon_custom_emoji_id": POSITIVE_EMOJI_ID,
+                        },
+                    ]
+                ]
+            },
+        }
+
+    async def test_custom_emoji_rejection_retries_plain_card_and_keeps_every_action(self):
+        api = Telegram("123456:" + "X" * 30)
+        params = self.decorated_params()
+        with patch.object(
+            api,
+            "_call",
+            side_effect=[TelegramError(400, "CUSTOM_EMOJI_NOT_ALLOWED"), {"message_id": 101}, True],
+        ) as request:
+            result = await api.call("sendMessage", **params)
+            self.assertEqual(result["message_id"], 101)
+            self.assertEqual(request.call_count, 2)
+            first, plain = request.call_args_list[0].args[1], request.call_args_list[1].args[1]
+            self.assertTrue(has_custom_emoji(first))
+            self.assertFalse(has_custom_emoji(plain))
+            self.assertEqual(plain["text"], "500 ⭐")
+            self.assertEqual(
+                [button["callback_data"] for button in plain["reply_markup"]["inline_keyboard"][0]],
+                ["g:test:reject", "g:test:accept"],
+            )
+            self.assertEqual(plain["reply_markup"]["inline_keyboard"][0][0]["text"], "❌ Отклонить")
+            self.assertEqual(plain["reply_markup"]["inline_keyboard"][0][1]["text"], "✅ Принять")
+            await api.call("editMessageText", message_id=101, **params)
+            self.assertFalse(has_custom_emoji(request.call_args.args[1]))
+            self.assertEqual(request.call_count, 3)
+        self.assertTrue(has_custom_emoji(params))
+
+    async def test_business_emoji_rejection_does_not_disable_direct_bot_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(
+            api, "_call", side_effect=[TelegramError(400, "BUTTON_ICON_INVALID"), True, True]
+        ) as request:
+            await api.call("sendMessage", **self.decorated_params())
+            direct = self.decorated_params()
+            direct.pop("business_connection_id")
+            direct["chat_id"] = BUYER
+            await api.call("sendMessage", **direct)
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
+
+    async def test_unsuccessful_plain_fallback_does_not_disable_custom_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(
+            api,
+            "_call",
+            side_effect=[
+                TelegramError(400, "CUSTOM_EMOJI_NOT_ALLOWED"),
+                TelegramError(400, "PEER_FLOOD"),
+                {"message_id": 101},
+            ],
+        ) as request:
+            with self.assertRaisesRegex(TelegramError, "PEER_FLOOD"):
+                await api.call("sendMessage", **self.decorated_params())
+            await api.call("sendMessage", **self.decorated_params())
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
+
+    async def test_ambiguous_send_never_retries_with_different_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=TransportError("offline")) as request:
+            with self.assertRaises(TransportError):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+
+    async def test_unrelated_rejection_is_not_hidden_by_emoji_fallback(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(
+            api, "_call", side_effect=TelegramError(400, "BUTTON_USER_INVALID")
+        ) as request:
+            with self.assertRaises(TelegramError):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+
+    async def test_peer_flood_is_never_retried_or_treated_as_an_emoji_restriction(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(
+            api,
+            "_call",
+            side_effect=[TelegramError(400, "Bad Request: PEER_FLOOD"), {"message_id": 101}],
+        ) as request:
+            with self.assertRaisesRegex(TelegramError, "PEER_FLOOD"):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+            # A later user-requested send still uses the original icons.
+            await api.call("sendMessage", **self.decorated_params())
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
+
+    async def test_business_command_deletion_is_available_without_chat_id(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", return_value=True) as request:
+            await api.call(
+                "deleteBusinessMessages", business_connection_id=CONNECTION["id"], message_ids=[10]
+            )
+        request.assert_called_once_with(
+            "deleteBusinessMessages",
+            {"business_connection_id": CONNECTION["id"], "message_ids": [10]},
+            20,
+        )
+
+    async def test_webhook_deletion_is_available_and_preserves_queue_parameter(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", return_value=True) as request:
+            self.assertTrue(await api.call("deleteWebhook", drop_pending_updates=False))
+        request.assert_called_once_with("deleteWebhook", {"drop_pending_updates": False}, 20)
+
+    async def test_send_is_not_retried_after_ambiguous_network_failure(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=TransportError("uncertain")) as request:
+            with self.assertRaises(TransportError):
+                await api.call("sendMessage", chat_id=BUYER, text="Offer")
+            self.assertEqual(request.call_count, 1)
+
+    async def test_token_redaction_and_payment_methods_unavailable(self):
+        token = "123456:" + "X" * 30
+        api = Telegram(token)
+        self.assertNotIn(token, api._redact(f"https://api.telegram.org/bot{token}/getMe"))
+        with self.assertRaises(ValueError):
+            await api.call("transferGift", new_owner_chat_id=333)
+
+
+class AdminViewTests(unittest.TestCase):
+    def audit_row(self, event_id: int) -> dict:
+        return {
+            "id": event_id,
+            "at": 1800000000,
+            "kind": "transfer_claim",
+            "evidence": "user_statement",
+            "actor_id": SELLER,
+            "actor_first": '<a href="https://evil.test">Fake</a>',
+            "actor_last": "",
+            "actor_username": "fake<script>",
+            "recipient_id": BUYER,
+            "recipient_first": "Buyer",
+            "recipient_last": "",
+            "recipient_username": "real_buyer",
+            "gift_url": "https://t.me/nft/CupidCharm-15484",
+            "gift_name": "Cupid Charm #15484",
+            "amount": "8900",
+            "currency": "stars",
+        }
+
+    def test_profile_names_cannot_inject_links_into_admin_log(self):
+        text, markup = admin.log_page("transfers", [self.audit_row(1)])
+        self.assertNotIn('<a href="https://evil.test">', text)
+        self.assertIn("Fake", text)
+
+    def test_price_emoji_ids_and_admin_navigation_keep_full_string_ids(self):
+        row = self.audit_row(1)
+        for currency, emoji_id in [("stars", STARS_EMOJI_ID), ("gram", GRAM_EMOJI_ID)]:
+            row.update(amount="500", currency=currency)
+            text = admin.entry(row)
+            self.assertIn(f'<tg-emoji emoji-id="{emoji_id}">', text)
+        for markup in (admin.navigation(), admin.log_page("all", [row])[1]):
+            for line in markup["inline_keyboard"]:
+                for button in line:
+                    self.assertEqual(button["icon_custom_emoji_id"], POSITIVE_EMOJI_ID)
+        self.assertNotIn("fake<script>", text)
+        self.assertIn(f"tg://user?id={SELLER}", text)
+        self.assertIn("заявление участника", text)
+
+    def test_long_escaped_entries_paginate_without_exceeding_text_limit(self):
+        rows = [self.audit_row(event_id) for event_id in range(10, 4, -1)]
+        for row in rows:
+            row.update(actor_first="&" * 128, recipient_first="&" * 128, gift_name="&" * 200)
+        text, markup = admin.log_page("transfers", rows)
+        self.assertLessEqual(len(text), 4096)
+        older = [b for line in markup["inline_keyboard"] for b in line if b["text"] == "Старее"]
+        self.assertEqual(len(older), 1)
+        self.assertTrue(older[0]["callback_data"].startswith("a:transfers:"))
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_bothost_token_aliases_and_primary_token_precedence(self):
+        token = "123456:" + "X" * 30
+        for key in ("API_TOKEN", "TELEGRAM_BOT_TOKEN"):
+            with self.subTest(key=key), patch.dict(os.environ, {key: token}, clear=True):
+                self.assertEqual(Config.from_env().token, token)
+        with patch.dict(
+            os.environ, {"BOT_TOKEN": token, "API_TOKEN": "654321:" + "Y" * 30}, clear=True
+        ):
+            self.assertEqual(Config.from_env().token, token)
+
+    def test_invalid_primary_token_does_not_silently_use_another_bot(self):
+        with patch.dict(
+            os.environ, {"BOT_TOKEN": "invalid", "API_TOKEN": "123456:" + "X" * 30}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                Config.from_env()
+
+    def test_platform_data_dir_and_explicit_database_path(self):
+        env = {"BOT_TOKEN": "123456:" + "X" * 30, "DATA_DIR": "/app/data"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Config.from_env().db_path, "/app/data/offers.sqlite3")
+            os.environ["DB_PATH"] = "/app/data/existing.sqlite3"
+            self.assertEqual(Config.from_env().db_path, "/app/data/existing.sqlite3")
+
+    def test_only_token_is_needed_for_configuration(self):
+        with patch.dict(os.environ, {"BOT_TOKEN": "123456:" + "X" * 30}, clear=True):
+            config = Config.from_env()
+            self.assertEqual(config.admin_promo, "/ClezzyKryt")
+            self.assertNotIn("owner_ids", vars(config))
+
+    def test_env_is_literal_and_real_environment_has_precedence(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"BOT_NAME": "Server name"}, clear=True),
+        ):
+            path = Path(directory) / ".env"
+            path.write_text(
+                'BOT_NAME=File name\nDEFAULT_LANGUAGE="en"\nDB_PATH=data/$(unused).sqlite3\n',
+                encoding="utf-8",
+            )
+            load_dotenv(path)
+            self.assertEqual(os.environ["BOT_NAME"], "Server name")
+            self.assertEqual(os.environ["DEFAULT_LANGUAGE"], "en")
+            self.assertEqual(os.environ["DB_PATH"], "data/$(unused).sqlite3")
+
+
+if __name__ == "__main__":
+    unittest.main()
